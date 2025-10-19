@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Dict, List, Dict as _Dict
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 import discord
 from discord import app_commands
@@ -15,13 +15,21 @@ from discord import app_commands
 import aiohttp
 
 # ---------- Setup ----------
-load_dotenv()
-OPENAI_KEY = os.getenv("OPENAI_KEY")
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+# Load local .env if present (for local dev). In Codespaces, secrets arrive via OS env.
+dotenv_path = find_dotenv(usecwd=True)
+if dotenv_path:
+    load_dotenv(dotenv_path=dotenv_path, override=False)
 
-if not all([OPENAI_KEY, DISCORD_TOKEN, ASSISTANT_ID]):
-    raise SystemExit("Missing required env vars: OPENAI_KEY, DISCORD_TOKEN, ASSISTANT_ID")
+def _get_env(name: str, required: bool = True) -> str:
+    val = (os.getenv(name) or "").strip()
+    if required and not val:
+        raise SystemExit(f"Missing required env var: {name}")
+    return val
+
+OPENAI_KEY   = _get_env("OPENAI_KEY")
+DISCORD_TOKEN = _get_env("DISCORD_TOKEN")
+ASSISTANT_ID = _get_env("ASSISTANT_ID")
+BING_KEY     = (os.getenv("BING_KEY") or "").strip()  # optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 openai_client = OpenAI(api_key=OPENAI_KEY)
@@ -55,8 +63,12 @@ async def bing_news_search(session: aiohttp.ClientSession, query: str, count: in
     params = {"q": query, "count": count, "freshness": "Week", "mkt": "en-US", "textDecorations": False}
     headers = {"Ocp-Apim-Subscription-Key": BING_KEY}
     try:
-        async with session.get("https://api.bing.microsoft.com/v7.0/news/search",
-                               params=params, headers=headers, timeout=20) as r:
+        async with session.get(
+            "https://api.bing.microsoft.com/v7.0/news/search",
+            params=params,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
             if r.status != 200:
                 logging.warning(f"Bing News status {r.status} for query: {query}")
                 return []
@@ -81,7 +93,7 @@ def _simple_html_to_text(html: str) -> str:
 
 async def fetch_url_text(session: aiohttp.ClientSession, url: str) -> str:
     try:
-        async with session.get(url, timeout=20) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
                 return ""
             html = await r.text(errors="ignore")
@@ -98,7 +110,8 @@ async def gather_research(question: str) -> List[_Dict]:
     """
     comp = infer_competitors(question)
     queries = [f"{c} virtualization Kubernetes OpenShift competitor news" for c in comp]
-    queries.append(f"Red Hat OpenShift Virtualization {question or ''}".strip())
+    if question:
+        queries.append(f"Red Hat OpenShift Virtualization {question}".strip())
 
     results: List[_Dict] = []
     async with aiohttp.ClientSession() as session:
@@ -163,7 +176,6 @@ async def get_or_create_thread(channel_id: int) -> str:
 
 def run_assistant_blocking(thread_id: str, user_prompt: str, docs: List[_Dict]) -> str:
     """Blocking portion (run in a thread): create messages, run, return the latest assistant text."""
-    # Add user message with research bundle
     bundle = format_docs_for_model(docs)
     prompt = f"Question:\n{user_prompt}\n\nResearch Documents:\n{bundle}"
 
@@ -176,65 +188,104 @@ def run_assistant_blocking(thread_id: str, user_prompt: str, docs: List[_Dict]) 
     run = openai_client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=ASSISTANT_ID,
-        instructions=build_run_instructions()  # ✅ correct place for per-run “system” guidance
+        instructions=build_run_instructions()  # per-run system guidance
     )
 
     start = time.time()
-    # Poll for completion (simple, robust)
     while True:
         status = openai_client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
         if status.status == "completed":
             break
         if status.status in {"failed", "cancelled", "expired"}:
             raise RuntimeError(f"Assistant run ended with status: {status.status}")
-        if time.time() - start > 70:
+        if time.time() - start > 90:
             raise TimeoutError("Assistant run timed out")
         time.sleep(1.0)
 
     msgs = openai_client.beta.threads.messages.list(thread_id=thread_id)
     for m in msgs.data:
-        if m.role == "assistant":
-            if m.content and m.content[0].type == "text":
-                return m.content[0].text.value
+        if m.role == "assistant" and m.content and m.content[0].type == "text":
+            return m.content[0].text.value
     return "I couldn't produce a response this time."
 
 # ---------- Discord bot ----------
 intents = discord.Intents.default()
-# message_content not required for slash commands, but safe if you later add prefix commands:
+# Required for prefix commands like $question
 intents.message_content = True
 
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
+def _chunk_for_discord(text: str, limit: int = 1900) -> List[str]:
+    """Split long responses into 1900-char chunks (Discord hard cap ~2000)."""
+    chunks = []
+    while text:
+        chunks.append(text[:limit])
+        text = text[limit:]
+    return chunks
+
 @bot.event
 async def on_ready():
+    # Global sync (may take up to ~1 hour); you can later scope to a guild for instant sync.
     await tree.sync()
     logging.info(f"Logged in as {bot.user}")
 
+# Slash command remains available
 @tree.command(name="ask", description="Ask about OpenShift Virtualization and competitors")
 async def ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)  # visible 'thinking…'
-
     try:
         docs = await gather_research(question)
         if not docs:
-            await interaction.followup.send(
-                "I couldn’t gather sources right now. Please try again in a minute or rephrase your question."
-            )
+            await interaction.followup.send("I couldn’t gather sources right now. Please try again in a minute.")
             return
-
         thread_id = await get_or_create_thread(interaction.channel_id)
         answer = await asyncio.to_thread(run_assistant_blocking, thread_id, question, docs)
-
-        # Discord hard cap ~2000 chars; keep margin
-        if len(answer) > 1900:
-            answer = answer[:1900] + "\n… (truncated)"
-
-        await interaction.followup.send(answer)
-
+        for part in _chunk_for_discord(answer):
+            await interaction.followup.send(part)
     except Exception as e:
         logging.exception("Error handling /ask: %s", e)
         await interaction.followup.send("Something went wrong while researching or generating the answer.")
+
+# Prefix command the professor expects: $question ...
+@bot.event
+async def on_message(message: discord.Message):
+    # ignore messages from bots (including self)
+    if message.author.bot:
+        return
+
+    # quick heartbeat
+    if message.content.startswith("$hello"):
+        await message.channel.send("Hello! I am online and ready.")
+        return
+
+    if message.content.startswith("$question"):
+        q = message.content[len("$question"):].strip()
+        if not q:
+            await message.channel.send(
+                "Please type your question after `$question`, e.g.\n"
+                "`$question What are VMware’s latest moves vs OpenShift Virtualization?`"
+            )
+            return
+
+        # show typing while we research
+        async with message.channel.typing():
+            try:
+                docs = await gather_research(q)
+                if not docs:
+                    await message.channel.send("I couldn’t gather any sources right now. Try again in a few minutes.")
+                    return
+
+                thread_id = await get_or_create_thread(message.channel.id)
+                answer = await asyncio.to_thread(run_assistant_blocking, thread_id, q, docs)
+
+                # send in chunks if long
+                for part in _chunk_for_discord(answer):
+                    await message.channel.send(part)
+
+            except Exception as e:
+                logging.exception("Error handling $question: %s", e)
+                await message.channel.send("⚠️ Something went wrong while researching or generating the answer.")
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
