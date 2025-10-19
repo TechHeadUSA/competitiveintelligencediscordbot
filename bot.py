@@ -1,291 +1,219 @@
-# bot.py
 import os
 import time
 import asyncio
 import logging
-import re
-from typing import Dict, List, Dict as _Dict
+from typing import Dict
 
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
 from openai import OpenAI
 import discord
 from discord import app_commands
 
-# Optional: external calls for news and site content
-import aiohttp
-
 # ---------- Setup ----------
-# Load local .env if present (for local dev). In Codespaces, secrets arrive via OS env.
-dotenv_path = find_dotenv(usecwd=True)
-if dotenv_path:
-    load_dotenv(dotenv_path=dotenv_path, override=False)
+load_dotenv()
+OPENAI_KEY = os.getenv("OPENAI_KEY")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-def _get_env(name: str, required: bool = True) -> str:
-    val = (os.getenv(name) or "").strip()
-    if required and not val:
-        raise SystemExit(f"Missing required env var: {name}")
-    return val
-
-OPENAI_KEY   = _get_env("OPENAI_KEY")
-DISCORD_TOKEN = _get_env("DISCORD_TOKEN")
-ASSISTANT_ID = _get_env("ASSISTANT_ID")
-BING_KEY     = (os.getenv("BING_KEY") or "").strip()  # optional
+if not all([OPENAI_KEY, DISCORD_TOKEN, ASSISTANT_ID]):
+    raise SystemExit("Missing required env vars: OPENAI_KEY, DISCORD_TOKEN, ASSISTANT_ID")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 openai_client = OpenAI(api_key=OPENAI_KEY)
 
-# Keep one assistant thread per Discord channel (or per user, if you prefer)
+# Keep one assistant thread per Discord channel
 CHANNEL_THREAD_CACHE: Dict[int, str] = {}
 
-# ---------- Competitors & domains ----------
-DEFAULT_COMPETITORS: Dict[str, List[str]] = {
-    "vmware": ["vmware.com", "broadcom.com"],
-    "nutanix": ["nutanix.com"],
-    "aws": ["aws.amazon.com", "aws.amazon.com/eks", "aws.amazon.com/ec2"],
-    "azure": ["azure.microsoft.com", "learn.microsoft.com/azure/openshift"],
-    "google": ["cloud.google.com", "cloud.google.com/kubernetes-engine"],
-    "oracle": ["oracle.com/cloud"],
-    "suse": ["suse.com", "rancher.com"],
-    # include Red Hat for parity/comparisons
-    "redhat": ["redhat.com/openshift/virtualization", "redhat.com/openshift"],
-}
-
-def infer_competitors(question: str) -> List[str]:
-    q = (question or "").lower()
-    hits = [k for k in DEFAULT_COMPETITORS.keys() if k in q]
-    return hits or list(DEFAULT_COMPETITORS.keys())
-
-# ---------- Lightweight research layer ----------
-async def bing_news_search(session: aiohttp.ClientSession, query: str, count: int = 8) -> List[_Dict]:
-    """Return [{title, url, source}] via Bing News API v7. If no key, return []."""
-    if not BING_KEY:
-        return []
-    params = {"q": query, "count": count, "freshness": "Week", "mkt": "en-US", "textDecorations": False}
-    headers = {"Ocp-Apim-Subscription-Key": BING_KEY}
-    try:
-        async with session.get(
-            "https://api.bing.microsoft.com/v7.0/news/search",
-            params=params,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            if r.status != 200:
-                logging.warning(f"Bing News status {r.status} for query: {query}")
-                return []
-            data = await r.json()
-            out = []
-            for it in data.get("value", []):
-                out.append({
-                    "title": it.get("name", ""),
-                    "url": it.get("url", ""),
-                    "source": (it.get("provider") or [{}])[0].get("name", ""),
-                })
-            return out
-    except Exception as e:
-        logging.warning(f"Bing News error for '{query}': {e}")
-        return []
-
-def _simple_html_to_text(html: str) -> str:
-    text = re.sub(r"(?is)<script.*?</script>|<style.*?</style>", " ", html)
-    text = re.sub(r"(?is)<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-async def fetch_url_text(session: aiohttp.ClientSession, url: str) -> str:
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-            if r.status != 200:
-                return ""
-            html = await r.text(errors="ignore")
-            return _simple_html_to_text(html)[:20000]
-    except Exception:
-        return ""
-
-async def gather_research(question: str) -> List[_Dict]:
+# ---------- Assistant Configuration ----------
+def get_system_instructions() -> str:
     """
-    Return a list of dicts: {title, url, source, text}
-    Pulls:
-      - Bing News (if key present) for each inferred competitor + the question
-      - Official competitor site homepages for latest messaging
+    Core identity and operating instructions for the assistant.
+    Configure this in the OpenAI Assistant dashboard OR pass it per-run.
     """
-    comp = infer_competitors(question)
-    queries = [f"{c} virtualization Kubernetes OpenShift competitor news" for c in comp]
-    if question:
-        queries.append(f"Red Hat OpenShift Virtualization {question}".strip())
+    return """You are a Product Marketing Manager for Red Hat OpenShift Virtualization.
 
-    results: List[_Dict] = []
-    async with aiohttp.ClientSession() as session:
-        # News
-        for q in queries:
-            hits = await bing_news_search(session, q)
-            results.extend(hits)
+YOUR ROLE:
+- Research and provide validated, high-quality competitive intelligence
+- Focus on OpenShift Virtualization vs. competitors: VMware, Nutanix, AWS, Azure, Google Cloud, Oracle, SUSE/Rancher
+- Be factual, objective, and evidence-based
+- Always cite your sources with URLs
 
-        # Official sites
-        for c in comp:
-            for domain in DEFAULT_COMPETITORS.get(c, []):
-                url = f"https://{domain}" if not domain.startswith("http") else domain
-                results.append({"title": f"{c} site: {domain}", "url": url, "source": domain})
+OUTPUT FORMAT:
+1. **Executive Summary** (3-5 key bullets)
+2. **Competitive Insights** (organized by competitor when relevant)
+3. **Risks & Opportunities** (strategic implications)
+4. **Sources** (list all URLs referenced)
 
-        # Dedupe by URL (preserve order)
-        seen = set()
-        deduped = []
-        for it in results:
-            u = it.get("url", "")
-            if u and u not in seen:
-                seen.add(u)
-                deduped.append(it)
+GUIDELINES:
+- Use web search to find current information when needed
+- Be vendor-neutral in analysis - let facts speak
+- If information is unavailable or uncertain, say so explicitly
+- Focus on technical capabilities, pricing, market positioning, and recent news
+- Highlight Red Hat's strengths without being promotional
+- No speculation - only cite verifiable information"""
 
-        # Fetch bodies (cap to reduce latency)
-        final: List[_Dict] = []
-        for it in deduped[:15]:
-            body = await fetch_url_text(session, it["url"])
-            if body:
-                it["text"] = body
-                final.append(it)
-        return final
-
-# ---------- Assistants helpers ----------
-def build_run_instructions() -> str:
-    return (
-        "You are a Competitive Intelligence assistant for Red Hat OpenShift Virtualization.\n"
-        "Use ONLY the provided 'Research Documents' to answer. If details are missing, say so.\n"
-        "Output format:\n"
-        "1) Executive Summary (3–5 bullets)\n"
-        "2) Key Insights (per competitor, concise bullets)\n"
-        "3) Risks & Opportunities\n"
-        "4) Sources (list raw URLs used)\n"
-        "Rules: Be factual and vendor-neutral. No speculation without evidence. Always include sources."
-    )
-
-def format_docs_for_model(docs: List[_Dict]) -> str:
-    parts = []
-    for d in docs:
-        parts.append(
-            f"TITLE: {d.get('title','')}\n"
-            f"URL: {d.get('url','')}\n"
-            f"EXCERPT:\n{(d.get('text','') or '')[:3000]}\n---"
-        )
-    return "\n".join(parts)
-
+# ---------- Assistants API Helpers ----------
 async def get_or_create_thread(channel_id: int) -> str:
+    """Get existing thread for channel or create new one."""
     if channel_id in CHANNEL_THREAD_CACHE:
         return CHANNEL_THREAD_CACHE[channel_id]
-    th = openai_client.beta.threads.create()
-    CHANNEL_THREAD_CACHE[channel_id] = th.id
-    return th.id
+    
+    thread = openai_client.beta.threads.create()
+    CHANNEL_THREAD_CACHE[channel_id] = thread.id
+    logging.info(f"Created new thread {thread.id} for channel {channel_id}")
+    return thread.id
 
-def run_assistant_blocking(thread_id: str, user_prompt: str, docs: List[_Dict]) -> str:
-    """Blocking portion (run in a thread): create messages, run, return the latest assistant text."""
-    bundle = format_docs_for_model(docs)
-    prompt = f"Question:\n{user_prompt}\n\nResearch Documents:\n{bundle}"
-
+def run_assistant_blocking(thread_id: str, user_question: str) -> str:
+    """
+    Run the assistant (blocking call - use in thread pool).
+    Returns the assistant's response text.
+    """
+    # Add user message
     openai_client.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
-        content=prompt
+        content=user_question
     )
-
+    
+    # Create and run
     run = openai_client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=ASSISTANT_ID,
-        instructions=build_run_instructions()  # per-run system guidance
+        instructions=get_system_instructions()
     )
-
+    
+    # Poll for completion
     start = time.time()
     while True:
-        status = openai_client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        status = openai_client.beta.threads.runs.retrieve(
+            thread_id=thread_id, 
+            run_id=run.id
+        )
+        
         if status.status == "completed":
             break
+        
         if status.status in {"failed", "cancelled", "expired"}:
-            raise RuntimeError(f"Assistant run ended with status: {status.status}")
-        if time.time() - start > 90:
-            raise TimeoutError("Assistant run timed out")
-        time.sleep(1.0)
+            error_msg = getattr(status, 'last_error', None)
+            raise RuntimeError(f"Assistant run {status.status}: {error_msg}")
+        
+        if time.time() - start > 120:  # 2 minute timeout
+            openai_client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
+            raise TimeoutError("Assistant took too long to respond")
+        
+        time.sleep(1.5)
+    
+    # Get response
+    messages = openai_client.beta.threads.messages.list(thread_id=thread_id, limit=1)
+    for msg in messages.data:
+        if msg.role == "assistant":
+            for content in msg.content:
+                if content.type == "text":
+                    return content.text.value
+    
+    return "I couldn't generate a response. Please try rephrasing your question."
 
-    msgs = openai_client.beta.threads.messages.list(thread_id=thread_id)
-    for m in msgs.data:
-        if m.role == "assistant" and m.content and m.content[0].type == "text":
-            return m.content[0].text.value
-    return "I couldn't produce a response this time."
-
-# ---------- Discord bot ----------
+# ---------- Discord Bot ----------
 intents = discord.Intents.default()
-# Required for prefix commands like $question
 intents.message_content = True
 
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-def _chunk_for_discord(text: str, limit: int = 1900) -> List[str]:
-    """Split long responses into 1900-char chunks (Discord hard cap ~2000)."""
-    chunks = []
-    while text:
-        chunks.append(text[:limit])
-        text = text[limit:]
-    return chunks
-
 @bot.event
 async def on_ready():
-    # Global sync (may take up to ~1 hour); you can later scope to a guild for instant sync.
     await tree.sync()
-    logging.info(f"Logged in as {bot.user}")
+    logging.info(f"✅ Logged in as {bot.user}")
+    logging.info(f"📊 Assistant ID: {ASSISTANT_ID}")
 
-# Slash command remains available
-@tree.command(name="ask", description="Ask about OpenShift Virtualization and competitors")
+@tree.command(
+    name="ask",
+    description="Ask competitive intelligence questions about OpenShift Virtualization"
+)
 async def ask(interaction: discord.Interaction, question: str):
-    await interaction.response.defer(thinking=True)  # visible 'thinking…'
+    """Main command - ask the CI assistant a question."""
+    await interaction.response.defer(thinking=True)
+    
     try:
-        docs = await gather_research(question)
-        if not docs:
-            await interaction.followup.send("I couldn’t gather sources right now. Please try again in a minute.")
-            return
+        # Get or create thread for this channel
         thread_id = await get_or_create_thread(interaction.channel_id)
-        answer = await asyncio.to_thread(run_assistant_blocking, thread_id, question, docs)
-        for part in _chunk_for_discord(answer):
-            await interaction.followup.send(part)
+        
+        # Run assistant (in thread pool to avoid blocking)
+        answer = await asyncio.to_thread(
+            run_assistant_blocking, 
+            thread_id, 
+            question
+        )
+        
+        # Split long responses (Discord limit ~2000 chars)
+        if len(answer) <= 1900:
+            await interaction.followup.send(answer)
+        else:
+            # Split into chunks
+            chunks = [answer[i:i+1900] for i in range(0, len(answer), 1900)]
+            await interaction.followup.send(chunks[0])
+            for chunk in chunks[1:]:
+                await interaction.channel.send(chunk)
+    
+    except TimeoutError:
+        await interaction.followup.send(
+            "⏱️ The request took too long. Please try a more specific question."
+        )
     except Exception as e:
-        logging.exception("Error handling /ask: %s", e)
-        await interaction.followup.send("Something went wrong while researching or generating the answer.")
+        logging.exception("Error in /ask command")
+        await interaction.followup.send(
+            "❌ Something went wrong. Please try again or rephrase your question."
+        )
 
-# Prefix command the professor expects: $question ...
-@bot.event
-async def on_message(message: discord.Message):
-    # ignore messages from bots (including self)
-    if message.author.bot:
-        return
+@tree.command(
+    name="reset",
+    description="Clear conversation history for this channel"
+)
+async def reset(interaction: discord.Interaction):
+    """Reset the conversation thread for this channel."""
+    channel_id = interaction.channel_id
+    
+    if channel_id in CHANNEL_THREAD_CACHE:
+        del CHANNEL_THREAD_CACHE[channel_id]
+        await interaction.response.send_message(
+            "✅ Conversation history cleared for this channel.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "ℹ️ No conversation history to clear.",
+            ephemeral=True
+        )
 
-    # quick heartbeat
-    if message.content.startswith("$hello"):
-        await message.channel.send("Hello! I am online and ready.")
-        return
+@tree.command(
+    name="help",
+    description="Learn how to use the CI Assistant"
+)
+async def help_command(interaction: discord.Interaction):
+    """Show help information."""
+    help_text = """**Red Hat OpenShift Virtualization - Competitive Intelligence Assistant**
 
-    if message.content.startswith("$question"):
-        q = message.content[len("$question"):].strip()
-        if not q:
-            await message.channel.send(
-                "Please type your question after `$question`, e.g.\n"
-                "`$question What are VMware’s latest moves vs OpenShift Virtualization?`"
-            )
-            return
+I'm your Product Marketing Manager specialized in competitive intelligence.
 
-        # show typing while we research
-        async with message.channel.typing():
-            try:
-                docs = await gather_research(q)
-                if not docs:
-                    await message.channel.send("I couldn’t gather any sources right now. Try again in a few minutes.")
-                    return
+**Commands:**
+• `/ask [question]` - Ask about competitors, features, pricing, market trends
+• `/reset` - Clear conversation history for this channel
+• `/help` - Show this message
 
-                thread_id = await get_or_create_thread(message.channel.id)
-                answer = await asyncio.to_thread(run_assistant_blocking, thread_id, q, docs)
+**Example Questions:**
+• "Compare OpenShift Virtualization to VMware vSphere"
+• "What are Nutanix's latest announcements?"
+• "How does our pricing compare to AWS?"
+• "What are the key differentiators vs Azure?"
 
-                # send in chunks if long
-                for part in _chunk_for_discord(answer):
-                    await message.channel.send(part)
-
-            except Exception as e:
-                logging.exception("Error handling $question: %s", e)
-                await message.channel.send("⚠️ Something went wrong while researching or generating the answer.")
+**Tips:**
+• I maintain conversation context within each channel
+• I search the web for current information
+• All answers include source citations
+• Be specific for better results"""
+    
+    await interaction.response.send_message(help_text, ephemeral=True)
 
 if __name__ == "__main__":
+    logging.info("🚀 Starting Red Hat CI Assistant Bot...")
     bot.run(DISCORD_TOKEN)
