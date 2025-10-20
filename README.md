@@ -5,3 +5,7 @@
 **Project Type:** Option 1 – Discord AI Agent  
 **Platform:** Discord + OpenAI Assistants API  
 **Purpose: Assumes the persona of a Product Marketing Manager for Red Hat OpenShift Virtualization, in the context of answering competitive intelligence questions
+## Features
+- `/ask` - Ask competitive intelligence questions
+- `/reset` - Clear conversation history
+- `/help` - Show available commands
